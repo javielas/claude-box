@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# claude-box: run Claude Code in an isolated Podman container for one project.
+#
+# Usage: claude-box <project-dir> [data-dir]
+#   <project-dir>  git repo, mounted read-write at /work
+#   [data-dir]     raw data, mounted READ-ONLY at /work/data (optional)
+#
+# Before the session: pulls the latest changes from the remote.
+# After the session:  shows changes and offers to commit and push.
+
+set -euo pipefail
+
+if [[ $# -lt 1 ]]; then
+  echo "Usage: claude-box <project-dir> [data-dir]" >&2
+  exit 1
+fi
+
+proj=$(realpath "$1")
+[[ -d $proj ]] || { echo "Project folder not found: $proj" >&2; exit 1; }
+name=$(basename "$proj")
+
+args=(
+  -it --rm
+  --name "claude-$name"
+  --userns=keep-id
+  -v "$proj":/work:Z
+  -v claude-home:/home/dev:U
+  -e UV_PROJECT_ENVIRONMENT="/home/dev/venvs/$name"
+  -e DATA_DIR=/work/data
+  -p 127.0.0.1:2718:2718
+)
+
+if [[ $# -ge 2 ]]; then
+  data=$(realpath "$2")
+  [[ -d $data ]] || { echo "Data folder not found: $data" >&2; exit 1; }
+  args+=(-v "$data":/work/data:ro,Z)
+fi
+
+cd "$proj"
+
+is_repo=false
+has_remote=false
+if git rev-parse --git-dir >/dev/null 2>&1; then
+  is_repo=true
+  [[ -n $(git remote) ]] && has_remote=true
+fi
+
+# --- Load SSH key into the agent if it isn't there yet (asks passphrase once) ---
+if $has_remote; then
+  set +e
+  ssh-add -l >/dev/null 2>&1
+  agent_status=$?
+  set -e
+  if [[ $agent_status -eq 1 ]]; then
+    ssh-add ~/.ssh/id_ed25519 || true
+  fi
+fi
+
+# --- Start of session: get the latest from the other PC ---
+if $has_remote; then
+  echo "Pulling latest changes..."
+  git pull --rebase --autostash || echo "⚠ Pull failed, check 'git status' before working."
+fi
+
+# --- What runs inside the container ---
+# 1. sync the environment, 2. start marimo in the background, 3. start Claude,
+# 4. when Claude exits, leave a shell open (type 'exit' to end the session).
+inner='
+[ -f pyproject.toml ] && uv sync
+uv run marimo edit --host 0.0.0.0 --port 2718 --headless --no-token \
+  > /tmp/marimo.log 2>&1 &
+claude
+echo
+echo "Claude exited. marimo is still running at http://localhost:2718"
+echo "Type exit to end the session (this stops marimo and offers to commit/push)."
+exec bash
+'
+
+# Open marimo in the host browser once it has had time to start
+(sleep 8; xdg-open http://localhost:2718 >/dev/null 2>&1) &
+
+echo "Starting container claude-$name..."
+podman run "${args[@]}" claude-box bash -c "$inner" || true
+
+# --- End of session: commit and push ---
+if $is_repo && [[ -n $(git status --porcelain) ]]; then
+  echo
+  git status --short
+  read -rp "Commit these changes? [Y/n] " ans
+  if [[ ${ans:-Y} =~ ^[Yy]$ ]]; then
+    read -rp "Message (Enter for default): " msg
+    git add -A
+    git commit -m "${msg:-Session $(date '+%Y-%m-%d %H:%M') on $(hostname)}" || true
+    if $has_remote; then
+      git push || echo "⚠ Push failed, run 'git push' manually."
+    fi
+  fi
+elif $has_remote && [[ -n $(git log '@{u}..' 2>/dev/null) ]]; then
+  # No new changes, but earlier commits were never pushed
+  read -rp "You have unpushed commits. Push now? [Y/n] " ans
+  [[ ${ans:-Y} =~ ^[Yy]$ ]] && { git push || echo "⚠ Push failed."; }
+fi
