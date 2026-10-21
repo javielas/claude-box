@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # claude-box: run Claude Code in an isolated Podman container for one project.
 #
-# Usage: claude-box <project-dir> [data-dir]
+# Usage: claude-box <project-dir> [data-dir] [notebook]
 #   <project-dir>  git repo, mounted read-write at /work
 #   [data-dir]     raw data, mounted READ-ONLY at /work/data (optional)
+#   [notebook]     marimo notebook to pair Claude with, relative to
+#                  <project-dir> (optional; use "" to skip the data dir)
 #
 # Before the session: pulls the latest changes from the remote.
 # After the session:  shows changes and offers to commit and push.
@@ -11,7 +13,7 @@
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
-  echo "Usage: claude-box <project-dir> [data-dir]" >&2
+  echo "Usage: claude-box <project-dir> [data-dir] [notebook]" >&2
   exit 1
 fi
 
@@ -30,10 +32,16 @@ args=(
   -p 127.0.0.1:2718:2718
 )
 
-if [[ $# -ge 2 ]]; then
+if [[ $# -ge 2 && -n $2 ]]; then
   data=$(realpath "$2")
   [[ -d $data ]] || { echo "Data folder not found: $data" >&2; exit 1; }
   args+=(-v "$data":/work/data:ro,Z)
+fi
+
+if [[ $# -ge 3 && -n $3 ]]; then
+  [[ -f "$proj/$3" ]] || { echo "Notebook not found: $proj/$3" >&2; exit 1; }
+  # Passed as an environment variable so paths with spaces are safe
+  args+=(-e NOTEBOOK="$3")
 fi
 
 cd "$proj"
@@ -67,9 +75,19 @@ fi
 # 4. when Claude exits, leave a shell open (type 'exit' to end the session).
 inner='
 [ -f pyproject.toml ] && uv sync
-uv run marimo edit --host 0.0.0.0 --port 2718 --headless --no-token \
+uv run marimo edit --host 0.0.0.0 --port 2718 --headless --no-token --watch \
   > /tmp/marimo.log 2>&1 &
-claude
+if [ -n "${NOTEBOOK:-}" ]; then
+  # Wait for marimo to be up (max ~30 s), then start Claude paired to the notebook
+  for i in $(seq 30); do
+    curl -s -o /dev/null http://localhost:2718/ && break
+    sleep 1
+  done
+  claude "$(uvx marimo@latest pair prompt --url http://localhost:2718/ \
+                --file "$NOTEBOOK" --claude)"
+else
+  claude
+fi
 echo
 echo "Claude exited. marimo is still running at http://localhost:2718"
 echo "Type exit to end the session (this stops marimo and offers to commit/push)."
