@@ -2,10 +2,9 @@
 # claude-box: run Claude Code in an isolated Podman container, with the
 # folders it may access listed in a session file.
 #
-# Usage: claude-box <session> [notebook]
+# Usage: claude-box <session>
 #   <session>   path to a session file, or just its name: "santanna" means
 #               ~/claude-box/sessions/santanna.conf
-#   [notebook]  marimo notebook to pair Claude with, relative to the work folder
 #
 # Session file format, one folder per line (# starts a comment):
 #   work  ~/Documents/Scripts        # required, exactly one: always rw, at /work
@@ -13,15 +12,19 @@
 #   repo  ~/code/some-lib       ro   # optional, any number: ro by default,
 #   repo  ~/code/other-lib      rw   #   mounted at /repos/<folder-name>
 #
+# Claude's temp/scratchpad folder (/tmp/claude-<uid> in the container) is kept
+# on the host in ~/claude-box/tmp/<session>/, so its files survive the session.
+#
 # Every read-write folder that is a git repo is pulled before the session and
 # offered a commit and push after it.
 
 set -euo pipefail
 
 SESSIONS_DIR="$HOME/claude-box/sessions"
+TMP_ROOT="$HOME/claude-box/tmp"
 
 if [[ $# -lt 1 ]]; then
-  echo "Usage: claude-box <session> [notebook]" >&2
+  echo "Usage: claude-box <session>" >&2
   echo "Available sessions:" >&2
   ls "$SESSIONS_DIR"/*.conf 2>/dev/null | xargs -rn1 basename | sed 's/\.conf$/  /' >&2
   exit 1
@@ -91,6 +94,15 @@ done < "$conf"
 
 [[ -n $work ]] || { echo "No 'work' folder in $conf" >&2; exit 1; }
 
+# --- Persistent Claude temp/scratchpad folder ---
+# With --userns=keep-id the container user has the same uid as you,
+# so Claude Code writes its temp files to /tmp/claude-<your uid>.
+uid=$(id -u)
+scratch="$TMP_ROOT/$name"
+mkdir -p "$scratch"
+mounts+=(-v "$scratch":/tmp/claude-"$uid":Z)
+echo "tmp   $scratch → /tmp/claude-$uid (rw)"
+
 args=(
   -it --rm
   --name "claude-$name"
@@ -99,13 +111,7 @@ args=(
   -v claude-home:/home/dev:U
   -e UV_PROJECT_ENVIRONMENT="/home/dev/venvs/$name"
   -e DATA_DIR=/work/data
-  -p 127.0.0.1:2718:2718
 )
-
-if [[ $# -ge 2 && -n $2 ]]; then
-  [[ -f "$work/$2" ]] || { echo "Notebook not found: $work/$2" >&2; exit 1; }
-  args+=(-e NOTEBOOK="$2")   # env var, so paths with spaces are safe
-fi
 
 # --- git helpers ---
 is_repo()    { git -C "$1" rev-parse --git-dir >/dev/null 2>&1; }
@@ -154,34 +160,20 @@ fi
 for d in "${sync_dirs[@]}"; do git_start "$d"; done
 
 # --- What runs inside the container ---
-# 1. sync the environment, 2. start marimo in the background, 3. start Claude,
-# 4. when Claude exits, leave a shell open (type 'exit' to end the session).
+# 1. sync the Python environment, 2. start Claude,
+# 3. when Claude exits, leave a shell open (type 'exit' to end the session).
 inner='
 [ -f pyproject.toml ] && uv sync
-uv run marimo edit --host 0.0.0.0 --port 2718 --headless --no-token --watch \
-  > /tmp/marimo.log 2>&1 &
-if [ -n "${NOTEBOOK:-}" ]; then
-  # Wait for marimo to be up (max ~30 s), then start Claude paired to the notebook
-  for i in $(seq 30); do
-    curl -s -o /dev/null http://localhost:2718/ && break
-    sleep 1
-  done
-  claude "$(uvx marimo@latest pair prompt --url http://localhost:2718/ \
-                --file "$NOTEBOOK" --claude)"
-else
-  claude
-fi
+claude
 echo
-echo "Claude exited. marimo is still running at http://localhost:2718"
-echo "Type exit to end the session (this stops marimo and offers to commit/push)."
+echo "Claude exited. Type exit to end the session (this offers to commit/push)."
 exec bash
 '
 
-# Open marimo in the host browser once it has had time to start
-(sleep 8; xdg-open http://localhost:2718 >/dev/null 2>&1) &
-
 echo "Starting container claude-$name..."
 podman run "${args[@]}" claude-box bash -c "$inner" || true
+
+echo "Claude temp files for this session are in: $scratch"
 
 # --- End of session ---
 for d in "${sync_dirs[@]}"; do git_end "$d"; done
